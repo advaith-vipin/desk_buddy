@@ -1,0 +1,6 @@
+pytoon==1.5.0
+audioop-lts
+pygame
+torchcodec
+ollama
+certifi

@@ -4,3 +4,4 @@ pygame
 torchcodec
 ollama
 certifi
+edge-tts

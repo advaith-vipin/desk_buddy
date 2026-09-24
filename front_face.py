@@ -55,8 +55,16 @@ def eye_openness(frame_index: float, fps: int = 48) -> float:
 
 
 def render_forward_frame(viseme_name: str, frame_index: int, fps: int = 48,
-                         size: tuple = (720, 720)) -> np.ndarray:
-    """Renders one front-facing cartoon frame with the given viseme mouth."""
+                         size: tuple = (720, 720), mood: str = "neutral") -> np.ndarray:
+    """Renders one cube-bot frame (white box, OLED screen, mood eyes).
+
+    The viseme drives the glowing mouth bar; `mood` selects the eyes.
+    Kept under the old name so existing --forward callers keep working.
+    NOTE: legacy toon-renderer body below is superseded (unreachable).
+    """
+    from cube_face import render_cube_frame
+
+    return render_cube_frame(viseme_name, frame_index, fps, size, mood=mood)
     canvas = Image.new("RGBA", size, (0, 0, 0, 0))
     d = ImageDraw.Draw(canvas)
 

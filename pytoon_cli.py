@@ -1,5 +1,8 @@
 """Generate a lip-synced cartoon animation from a text script or an audio file.
 
+Memory-integrated LLM assistant: the Ollama system prompt now instructs the model
+to use the provided CRUD methods (via memory_handler) for permanent recall.
+
 Uses the pytoon library (Wav2Vec2 forced alignment + visemes) under the hood.
 
 Examples:
@@ -13,6 +16,8 @@ import argparse
 import os
 import subprocess
 import sys
+
+from memory_handler import handle_user_text, get_memory_context
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TMP_DIR = os.path.join(HERE, ".tmp")
@@ -43,13 +48,49 @@ def run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
+EDGE_VOICE_DEFAULT = "en-US-AriaNeural"  # natural, Google-Assistant-like US voice
+
+
+def edge_tts_synthesize(text: str, out_mp3: str, rate: int = 150,
+                        pitch: float = 1.0, voice: str | None = None) -> None:
+    """Synthesizes text into an mp3 using Edge neural TTS (needs network).
+
+    Raises on any failure so callers can fall back to espeak.
+    rate is wpm (~150 = calm/clear); mapped to an edge-relative percent.
+    """
+    import asyncio
+
+    import edge_tts
+
+    pct = int(round((rate - 175) / 175 * 100))
+    pct = max(-50, min(50, pct))
+    kwargs: dict = {"voice": voice or EDGE_VOICE_DEFAULT, "rate": f"{pct:+d}%"}
+    if pitch and abs(pitch - 1.0) > 1e-6:
+        import math
+        st = int(round(12 * math.log2(pitch)))
+        kwargs["pitch"] = f"{st:+d}st"
+
+    async def _run():
+        await edge_tts.Communicate(text, **kwargs).save(out_mp3)
+
+    asyncio.run(_run())
+
+
 def synthesize_speech(text: str, out_mp3: str, voice: str | None = None,
-                      rate: int = 180, pitch: float = 1.0) -> None:
-    """Synthesizes text into an mp3 using the macOS 'say' TTS, then ffmpeg.
+                      rate: int = 180, pitch: float = 1.0,
+                      edge_voice: str | None = None) -> None:
+    """Synthesizes text into an mp3: Edge neural voice first, 'say' fallback.
 
     pitch > 1.0 raises the voice (chibi effect) without changing speed.
     """
     os.makedirs(TMP_DIR, exist_ok=True)
+    # Prefer the natural neural voice; fall back to local TTS offline.
+    try:
+        edge_tts_synthesize(text, out_mp3, rate=rate, pitch=pitch,
+                            voice=edge_voice or (voice if voice and "-" in voice else None))
+        return
+    except Exception as e:
+        print(f"(edge TTS failed: {e}, falling back to local voice)")
     script_file = os.path.join(TMP_DIR, "script.txt")
     aiff_file = os.path.join(TMP_DIR, "speech.aiff")
     with open(script_file, "w") as f:
@@ -82,19 +123,21 @@ def parse_args(argv=None):
     p.add_argument("--transcript", help="Transcript of the audio (improves alignment accuracy)")
     p.add_argument("--output", default="talking_face.output.mp4", help="Output .mp4 path")
     p.add_argument("--fps", type=int, default=48, help="Video frames per second")
-    p.add_argument("--voice", default=None,
-                   help="Fixed macOS TTS voice (default: picked by mood, Samantha if --no-mood)")
+    p.add_argument("--voice", default="AriaNeural",
+                   help="Fixed TTS voice (locked to AriaNeural)")
     p.add_argument("--rate", type=int, default=None,
                    help="TTS speech rate in words-per-minute-ish (default: picked by mood, 180 if --no-mood)")
+    p.add_argument("--edge-voice", default="en-US-AriaNeural",
+                   help="Edge neural voice (locked to en-US-AriaNeural)")
     p.add_argument("--background", help="Optional background video or image to overlay the avatar on")
     p.add_argument("--no-mood", action="store_true",
                    help="Disable mood-matched voices (use --voice/--rate or Samantha @180)")
     p.add_argument("--mood-llm", action="store_true",
                    help="Classify mood with Ollama instead of fast keywords (slower)")
-    p.add_argument("--ollama-model", default="gemma3:4b",
-                   help="Ollama model for --mood-llm (default gemma3:4b)")
-    p.add_argument("--chibi", dest="chibi", action="store_true", default=True,
-                   help="Chibi voice: raise pitch x1.25 (default on)")
+    p.add_argument("--ollama-model", default="gemma4:e2b", choices=["llama3.1:8b", "gemma4:e2b", "gemma3:4b", "llama3.2:1b", "qwen3:4b"],
+                   help="Ollama model for --mood-llm (default gemma4:e2b)")
+    p.add_argument("--chibi", dest="chibi", action="store_true", default=False,
+                   help="Chibi voice: raise pitch x1.25 (default off for a natural voice)")
     p.add_argument("--no-chibi", dest="chibi", action="store_false",
                    help="Disable the chibi pitch lift")
     p.add_argument("--pitch", type=float, default=None,
@@ -109,22 +152,36 @@ def parse_args(argv=None):
 
 
 MOOD_VOICES = {
-    # mood: (macOS 'say' voice, speech rate) — brisk pacing
-    "happy": ("Samantha", 215),
-    "excited": ("Samantha", 225),
-    "playful": ("Bubbles", 210),
-    "silly": ("Bubbles", 210),
-    "sad": ("Whisper", 160),
-    "lonely": ("Whisper", 160),
-    "angry": ("Zarvox", 190),
-    "calm": ("Samantha", 175),
-    "loving": ("Samantha", 175),
-    "neutral": ("Samantha", 210),  # casual everyday chat
+    # locked to AriaNeural forever per user request
+    "happy": ("AriaNeural", 170),
+    "excited": ("AriaNeural", 185),
+    "playful": ("AriaNeural", 175),
+    "silly": ("AriaNeural", 170),
+    "sad": ("AriaNeural", 130),
+    "lonely": ("AriaNeural", 125),
+    "angry": ("AriaNeural", 155),
+    "calm": ("AriaNeural", 140),
+    "loving": ("AriaNeural", 140),
+    "neutral": ("AriaNeural", 160),
 }
 
-# voice used when the user tells the avatar to do something (and no strong
-# emotion overrides it) — clear, attentive assistant tone
-TASK_VOICE = ("Flo", 205)
+# Edge TTS voice mappings - locked to AriaNeural forever per user request
+EDGE_VOICE_MAP = {
+    "happy": "en-US-AriaNeural",
+    "excited": "en-US-AriaNeural",
+    "playful": "en-US-AriaNeural",
+    "silly": "en-US-AriaNeural",
+    "sad": "en-US-AriaNeural",
+    "lonely": "en-US-AriaNeural",
+    "angry": "en-US-AriaNeural",
+    "calm": "en-US-AriaNeural",
+    "loving": "en-US-AriaNeural",
+    "neutral": "en-US-AriaNeural",
+    "task": "en-US-AriaNeural",
+}
+
+# voice locked to AriaNeural forever
+TASK_VOICE = ("AriaNeural", 160)
 # strong feelings keep their emotional voice even for commands
 EMOTIONAL_MOODS = {"sad", "lonely", "angry", "excited", "playful", "silly", "loving"}
 
@@ -141,7 +198,11 @@ MOOD_KEYWORDS = [
 
 
 def detect_mood(text: str, model: str | None = None) -> str:
-    """Fast keyword mood detection; Ollama classifier if model is given."""
+    """Fast keyword mood detection; Ollama classifier if model is given.
+
+    Pure function: never touches the SQLite memory backend. Memory commands
+    are handled by the chat layer (chat_with_memory / pytoon_live), not here.
+    """
     if model:
         try:
             import ollama
@@ -151,7 +212,8 @@ def detect_mood(text: str, model: str | None = None) -> str:
                 "content": ("Classify the mood of this short reply into exactly one word: "
                             "happy, excited, playful, sad, angry, calm, loving, neutral. "
                             f"Reply with only that word.\n\nReply: {text!r}"),
-            }])
+            }], options={"num_predict": 8, "num_ctx": 1024, "keep_alive": "10m"},
+                think=False)
             word = resp.message.content.strip().lower().split()[0].strip(".,!?\"'")
             if word in MOOD_VOICES:
                 return word
@@ -164,22 +226,76 @@ def detect_mood(text: str, model: str | None = None) -> str:
     return "neutral"
 
 
+def chat_with_memory(user_text: str, system_prompt: str | None = None, model: str = "llama3.1:8b") -> str:
+    """Send a message to Ollama with memory-aware system prompt.
+
+    - Processes any memory commands in user_text first (remember/forget/what do you remember).
+    - Appends the current memory context to the system prompt so the LLM has
+      awareness of previously stored facts.
+    - Calls ollama.chat() and returns the model's response string.
+    """
+    # 1. Handle explicit memory commands in the user's raw text
+    mem_status = handle_user_text(user_text)
+    if mem_status:
+        return mem_status
+
+    # 2. Build the final system prompt — include memory context if available
+    from datetime import datetime
+    current_dt = datetime.now().strftime("%A, %B %d, %Y, %I:%M %p")
+    
+    final_system = (system_prompt or "").replace("{current_datetime}", current_dt)
+    ctx = get_memory_context()
+    if ctx:
+        final_system = final_system + """
+
+---
+
+Your memory (check this FIRST when they ask about plans, reminders, or themselves):
+""" + ctx + """
+
+Only mention what's actually listed above. Never invent."""
+    # 3. Call Ollama
+    import ollama
+
+    messages = [
+        {"role": "system", "content": final_system},
+        {"role": "user", "content": user_text},
+    ]
+    think = False
+    resp = ollama.chat(model=model, messages=messages,
+                       options={"num_predict": 128, "num_ctx": 2048, "temperature": 0.8,
+                                "keep_alive": "10m"},
+                       think=think)
+    raw = resp.message.content.strip()
+    try:
+        from pytoon_live import clean_reply as _clean
+        cleaned = _clean(raw)
+        return cleaned or raw
+    except Exception:
+        return raw
+
+
 def resolve_voice(text: str, args, intent: str | None = None) -> tuple:
-    """Picks (voice, rate) for this line. Explicit --voice/--rate always win."""
+    """Picks (voice, rate, edge_voice) for this line. Explicit --voice/--rate always win."""
     if getattr(args, "no_mood", False):
+        edge_v = getattr(args, "edge_voice", None) or EDGE_VOICE_MAP["neutral"]
         return (getattr(args, "voice", None) or "Samantha",
-                getattr(args, "rate", None) or 200)
+                getattr(args, "rate", None) or 200,
+                edge_v)
     model = getattr(args, "ollama_model", None) if getattr(args, "mood_llm", False) else None
     mood = detect_mood(text, model)
     intent = intent or detect_intent(text)
     if intent == "task" and mood not in EMOTIONAL_MOODS:
         mvoice, mrate = TASK_VOICE
+        edge_v = EDGE_VOICE_MAP["task"]
     else:
         mvoice, mrate = MOOD_VOICES.get(mood, MOOD_VOICES["neutral"])
+        edge_v = EDGE_VOICE_MAP.get(mood, EDGE_VOICE_MAP["neutral"])
     voice = getattr(args, "voice", None) or mvoice
     rate = getattr(args, "rate", None) or mrate
-    print(f"(intent: {intent}, mood: {mood} -> voice {voice} @ {rate}wpm)")
-    return voice, rate
+    edge_voice = getattr(args, "edge_voice", None) or edge_v
+    print(f"(intent: {intent}, mood: {mood} -> voice {voice} @ {rate}wpm, edge: {edge_voice})")
+    return voice, rate, edge_voice
 
 
 CHIBI_PITCH = 1.25  # default chibi lift
@@ -331,9 +447,10 @@ def main(argv=None):
             sys.exit("error: empty script")
 
         audio_file = os.path.join(TMP_DIR, "speech.mp3")
-        voice, rate = resolve_voice(text, args)
+        voice, rate, edge_voice = resolve_voice(text, args)
         synthesize_speech(text, audio_file, voice=voice, rate=rate,
-                          pitch=resolve_pitch(args))
+                          pitch=resolve_pitch(args),
+                          edge_voice=edge_voice)
         print(f"Synthesized speech -> {audio_file}")
         transcript = args.transcript if args.transcript else text
     else:

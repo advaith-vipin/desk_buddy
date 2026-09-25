@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Runtime / generated
+.tmp/
+*.mp4
+*.wav
+*.mp3
+
+# Databases
+*.db
+*.db-shm
+*.db-wal
+
+# macOS
+.DS_Store
